@@ -3,6 +3,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { createServer } from './server.js';
 import { runWithCredentials } from './client.js';
 import { logger } from './utils/logger.js';
+import { MAX_REQUEST_BODY_BYTES } from './input-limits.js';
 import { verifyS2sHeader, S2S_HEADER } from './s2s-verify.js';
 
 // Public example values. A copied placeholder must not verify as a real secret,
@@ -140,6 +141,30 @@ export function startHttpServer(): Promise<Server> {
       return;
     }
 
+    // Gateway mode: the vendor credential header is required. Do not fall
+    // through to TELIVY_API_KEY in process.env, which would let any caller who
+    // reached this process use the container's credentials (CWE-306).
+    const gatewayApiKey = isGatewayMode ? headerValue(req.headers['x-telivy-api-key']) : undefined;
+    if (isGatewayMode && !gatewayApiKey) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(GATEWAY_CREDENTIALS_UNAUTHORIZED));
+      return;
+    }
+
+    // Body cap runs only after S2S and credential checks so unauthenticated callers still get 401.
+    const contentLength = Number(headerValue(req.headers['content-length']));
+    if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BODY_BYTES) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          error: { code: -32600, message: `Request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes` },
+          id: null,
+        })
+      );
+      return;
+    }
+
     const handle = async () => {
       // SECURITY-CRITICAL invariant: this transport MUST stay stateless
       // (sessionIdGenerator: undefined + enableJsonResponse: true).
@@ -153,6 +178,7 @@ export function startHttpServer(): Promise<Server> {
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
+        maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
       });
       res.on('close', () => {
         transport.close();
@@ -162,17 +188,8 @@ export function startHttpServer(): Promise<Server> {
       await transport.handleRequest(req, res);
     };
 
-    if (isGatewayMode) {
-      const apiKey = headerValue(req.headers['x-telivy-api-key']);
-      if (!apiKey) {
-        // Do not fall through to TELIVY_API_KEY in process.env. In gateway
-        // mode that would let any caller who reached this process use the
-        // container's credentials (CWE-306).
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(GATEWAY_CREDENTIALS_UNAUTHORIZED));
-        return;
-      }
-      await runWithCredentials({ apiKey }, handle);
+    if (gatewayApiKey) {
+      await runWithCredentials({ apiKey: gatewayApiKey }, handle);
       return;
     }
 
