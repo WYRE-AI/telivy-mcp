@@ -48,10 +48,8 @@ describe('countToolInputElements', () => {
   });
 
   it('builds the McpServer-compatible error result', () => {
-    expect(toolInputTooLargeResult('t')).toEqual({
-      content: [
-        { type: 'text', text: 'Invalid arguments for tool t: arguments contain more than the maximum of 10000 elements' },
-      ],
+    expect(toolInputTooLargeResult()).toEqual({
+      content: [{ type: 'text', text: 'Tool input exceeds the maximum of 10000 elements' }],
       isError: true,
     });
   });
@@ -65,7 +63,7 @@ function s2s(): string {
   return `${message},v1=${createHmac('sha256', S2S_SECRET).update(message).digest('hex')}`;
 }
 
-function post(port: number, headers: Record<string, string>, body: string, declaredLength?: number) {
+function post(port: number, headers: Record<string, string>, body: string, declaredLength?: number, chunked = false) {
   return new Promise<{ status: number; body: string }>((resolve, reject) => {
     const req = httpRequest(
       {
@@ -76,7 +74,9 @@ function post(port: number, headers: Record<string, string>, body: string, decla
         headers: {
           'content-type': 'application/json',
           accept: 'application/json, text/event-stream',
-          'content-length': String(declaredLength ?? Buffer.byteLength(body)),
+          ...(chunked
+            ? { 'transfer-encoding': 'chunked' }
+            : { 'content-length': String(declaredLength ?? Buffer.byteLength(body)) }),
           ...headers,
         },
       },
@@ -136,6 +136,22 @@ describe('HTTP request limits', () => {
     expect(invalid.status).toBe(401);
   });
 
+  it('returns 413 for an oversized chunked body with valid S2S', async () => {
+    const port = await listen();
+    const res = await post(port, { 'x-gateway-s2s': s2s() }, OVERSIZED, undefined, true);
+    expect(res.status).toBe(413);
+  });
+
+  it('returns 401 (not 413) in gateway mode when the credential header is missing', async () => {
+    process.env.AUTH_MODE = 'gateway';
+    const port = await listen();
+    const res = await post(port, { 'x-gateway-s2s': s2s() }, OVERSIZED);
+    expect(res.status).toBe(401);
+    expect(res.body).toContain('X-Telivy-Api-Key');
+    const withKey = await post(port, { 'x-gateway-s2s': s2s(), 'x-telivy-api-key': 'k' }, OVERSIZED);
+    expect(withKey.status).toBe(413);
+  });
+
   it('serves a normal initialize and tools/list', async () => {
     const port = await listen();
     const init = await post(
@@ -176,6 +192,7 @@ describe('HTTP request limits', () => {
     const result = JSON.parse(res.body).result;
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('maximum of 10000 elements');
+    expect(result.content[0].text).not.toContain('telivy_list_external_scans');
     expect(dispatch).not.toHaveBeenCalled();
   });
 });
